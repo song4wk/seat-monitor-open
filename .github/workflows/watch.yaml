@@ -1,12 +1,12 @@
 name: Course Seat Watch
 
 on:
-  push:
-    paths:
-      - '.github/workflows/watch.yml'
-  schedule:
-    # 每15分钟触发一次，避免单个job过长导致session不稳定
-    - cron: "*/15 * * * *"
+  # push:
+  #   paths:
+  #     - '.github/workflows/watch.yaml'
+  # schedule:
+  #   # 每15分钟触发一次，避免单个job过长导致session不稳定
+  #   - cron: "*/15 * * * *"
   workflow_dispatch:
 
 jobs:
