@@ -30,6 +30,7 @@ jobs:
         run: python -u seat_watch.py
         env:
           PYTHONUNBUFFERED: "1"
+          BASE: ${{ secrets.BASE }}
           USER_ID: ${{ secrets.USER_ID }}
           PASSWORD: ${{ secrets.PASSWORD }}
           BARK_KEY_1: ${{ secrets.BARK_KEY_1 }}
