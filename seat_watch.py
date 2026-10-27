@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 import requests
 from bs4 import BeautifulSoup
 
-BASE = "REDACTED"
+BASE = os.environ["BASE"]
 LOGIN_URL = f"{BASE}/login.asp"
 CARTYPE_URL = f"{BASE}/cartype.asp"
 RESERVE_URL = f"{BASE}/ReserveList.asp"
