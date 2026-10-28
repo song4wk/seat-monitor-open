@@ -220,9 +220,66 @@ def split_new_and_remind(slots, state, now_ts):
     return new, repeat, remind
 
 
+def new_stats():
+    return {"result": "ok", "reason": "", "checks": 0, "max_free": 0,
+            "notified_new": 0, "notified_repeat": 0, "notified_remind": 0}
+
+
+STATS = new_stats()
+
+
+def annotate(level, title, message):
+    """GitHub Actions 注解（notice / warning / error）。只写数量和原因，不写具体空位。"""
+    print(f"::{level} title={title}::{message}")
+
+
+def fail(reason):
+    STATS["result"] = "error"
+    STATS["reason"] = reason
+    annotate("error", "监控失败", reason)
+    return 1
+
+
+def render_summary(stats):
+    """Job Summary 的 Markdown。公开仓库，只含数量，不含空位日期/时间。"""
+    icon, label = {"ok": ("✅", "正常"), "skipped": ("⏭️", "已跳过（不在执行窗口）"),
+                   "error": ("❌", "异常")}[stats["result"]]
+    lines = [f"## {icon} 本轮监控：{label}", ""]
+    if stats["reason"]:
+        lines += [f"**原因**：{stats['reason']}", ""]
+    lines += [
+        "| 项目 | 数值 |", "|---|---|",
+        f"| 检查次数 | {stats['checks']} |",
+        f"| 本轮最多空位数 | {stats['max_free']} |",
+        f"| 新空位通知 | {stats['notified_new']} |",
+        f"| 二次通知 | {stats['notified_repeat']} |",
+        f"| 降级提醒 | {stats['notified_remind']} |",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def write_summary(stats):
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(render_summary(stats))
+    except OSError as exc:
+        log(f"摘要写入失败: {describe(exc)}")
+
+
 def handle_slots(slots, state, tag):
     new, repeat, remind = split_new_and_remind(slots, state, time.time())
     save_state(state)
+    STATS["checks"] += 1
+    STATS["max_free"] = max(STATS["max_free"], len(slots))
+    STATS["notified_new"] += len(new)
+    STATS["notified_repeat"] += len(repeat)
+    STATS["notified_remind"] += len(remind)
+    if new:
+        annotate("notice", "发现新空位", f"{len(new)} 个新空位，已通知")
     if slots:
         log(f"{tag} 🎉 发现空位: {'、'.join(slots)}"
             f"（新增 {len(new)}，二次 {len(repeat)}，提醒 {len(remind)}）")
@@ -252,6 +309,7 @@ def run():
     if not should_run():
         log("⏭️ 当前时间不在执行窗口，跳过本轮任务")
         log("========================================")
+        STATS["result"] = "skipped"
         return 0
 
     session = make_session()
@@ -260,14 +318,14 @@ def run():
     if html == "LIMIT_EXCEEDED":
         log("⛔ 今日操作次数已用尽，退出任务")
         notify_admin("⚠️ 监控失败", "今日操作次数已用尽")
-        return 1
+        return fail("今日操作次数已用尽")
     if html == "BAD_CREDENTIALS":
         notify_admin("⚠️ 监控失败", "账号或密码错误")
-        return 1
+        return fail("账号或密码错误")
     if not html:
         log("❌ 登录或 reserve 页面获取失败，退出任务")
         notify_admin("⚠️ 监控异常", "登录或 reserve 页面获取失败")
-        return 1
+        return fail("登录或 reserve 页面获取失败")
 
     log("✅ 登录成功，开始本轮短任务监控")
 
@@ -285,16 +343,17 @@ def run():
         except Exception as exc:
             errors += 1
             log(f"[{now}] ❌ 第 {idx} 次刷新发生网络异常: {describe(exc)}")
+            annotate("warning", "刷新网络异常", f"第 {idx} 次刷新失败（连续 {errors} 次）")
             if errors >= MAX_CONSECUTIVE_REFRESH_ERRORS:
                 notify_admin("⚠️ 监控中断", f"连续 {errors} 次刷新网络异常")
-                return 1
+                return fail(f"连续 {errors} 次刷新网络异常")
             continue
         errors = 0
 
         if "最新の内容に更新する" not in r.text:
             log(f"[{now}] ❌ 第 {idx} 次刷新失败，页面返回异常")
             notify_admin("⚠️ 监控中断", f"第 {idx} 次刷新失败")
-            return 1
+            return fail(f"第 {idx} 次刷新页面返回异常")
 
         payload = get_refresh_payload(r.text)
         handle_slots(find_free_slots(r.text), state, f"[{now}] [{idx}]")
@@ -309,7 +368,8 @@ def main():
     except Exception as exc:
         log(f"❌ 未预期的异常: {describe(exc)}")
         notify_admin("⚠️ 监控崩溃", describe(exc))
-        code = 1
+        code = fail(f"未预期的异常: {describe(exc)}")
+    write_summary(STATS)
     log("========================================")
     sys.exit(code)
 

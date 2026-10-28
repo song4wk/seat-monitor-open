@@ -24,6 +24,39 @@ def test_get_hidden_fields_missing_form():
     assert seat_watch.get_hidden_fields("<html></html>", "LOGIN") == {}
 
 
+def test_render_summary_ok_has_counts_only():
+    stats = seat_watch.new_stats()
+    stats.update(checks=8, max_free=2, notified_new=2, notified_repeat=2)
+    md = seat_watch.render_summary(stats)
+    assert "✅" in md and "| 检查次数 | 8 |" in md and "| 本轮最多空位数 | 2 |" in md
+    assert "10/30" not in md and "8:05" not in md
+
+
+def test_render_summary_skipped_and_error():
+    skipped = seat_watch.new_stats()
+    skipped["result"] = "skipped"
+    assert "⏭️" in seat_watch.render_summary(skipped)
+
+    err = seat_watch.new_stats()
+    err.update(result="error", reason="账号或密码错误")
+    md = seat_watch.render_summary(err)
+    assert "❌" in md and "账号或密码错误" in md
+
+
+def test_write_summary_appends_to_file(tmp_path, monkeypatch):
+    path = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(path))
+    seat_watch.write_summary(seat_watch.new_stats())
+    assert "本轮监控" in path.read_text()
+
+
+def test_fail_sets_stats_and_prints_error_annotation(capsys):
+    seat_watch.STATS.update(seat_watch.new_stats())
+    assert seat_watch.fail("x") == 1
+    assert seat_watch.STATS["result"] == "error"
+    assert "::error title=监控失败::x" in capsys.readouterr().out
+
+
 def test_new_slot_repeat_then_cooldown_then_gone():
     split = seat_watch.split_new_and_remind
     state = {}
