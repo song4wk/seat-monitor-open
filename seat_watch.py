@@ -44,7 +44,8 @@ MAX_CONSECUTIVE_REFRESH_ERRORS = 3
 
 # 已通知空位的状态文件（由 workflow 的 actions/cache 在各次运行间保存）
 STATE_FILE = Path(os.environ.get("STATE_FILE", ".state/notified.json"))
-REMIND_COOLDOWN = 30 * 60  # 空位持续存在时，每 30 分钟降级提醒一次
+CRITICAL_REPEATS = 2  # 每个空位最多发 2 次 critical（防止第一次没听到）
+REMIND_COOLDOWN = 30 * 60  # 之后空位持续存在时，每 30 分钟降级提醒一次
 
 
 def now_in_jst():
@@ -194,27 +195,43 @@ def save_state(state):
 
 
 def split_new_and_remind(slots, state, now_ts):
-    """返回 (新出现的空位, 需要降级提醒的持续空位)，并更新 state（只保留当前空位）。"""
+    """返回 (新出现, 二次 critical, 降级提醒)，并更新 state（只保留当前空位）。
+
+    state: {slot: {"ts": 上次通知时间, "count": 已发 critical 次数}}
+    第一次没听到的话，下一次检查（约 2 分钟后）空位仍在就再发一次 critical，之后按冷却时间降级提醒。
+    """
     current = set(slots)
-    new = [s for s in slots if s not in state]
-    remind = [s for s in slots if s in state and now_ts - state[s] >= REMIND_COOLDOWN]
-    for s in new + remind:
-        state[s] = now_ts
+    new, repeat, remind = [], [], []
+    for s in slots:
+        entry = state.get(s)
+        if not isinstance(entry, dict):
+            state[s] = {"ts": now_ts, "count": 1}
+            new.append(s)
+        elif entry["count"] < CRITICAL_REPEATS:
+            entry["count"] += 1
+            entry["ts"] = now_ts
+            repeat.append(s)
+        elif now_ts - entry["ts"] >= REMIND_COOLDOWN:
+            entry["ts"] = now_ts
+            remind.append(s)
     for s in list(state):
         if s not in current:
             del state[s]
-    return new, remind
+    return new, repeat, remind
 
 
 def handle_slots(slots, state, tag):
-    new, remind = split_new_and_remind(slots, state, time.time())
+    new, repeat, remind = split_new_and_remind(slots, state, time.time())
     save_state(state)
     if slots:
-        log(f"{tag} 🎉 发现空位: {'、'.join(slots)}（新增 {len(new)}，提醒 {len(remind)}）")
+        log(f"{tag} 🎉 发现空位: {'、'.join(slots)}"
+            f"（新增 {len(new)}，二次 {len(repeat)}，提醒 {len(remind)}）")
     else:
         log(f"{tag} 空位数: 0")
     if new:
         notify_all("有空位！", "、".join(new))
+    if repeat:
+        notify_all("有空位！（再次通知）", "、".join(repeat))
     if remind:
         notify_all("仍有空位", "、".join(remind), critical=False)
 
