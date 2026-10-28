@@ -14,6 +14,7 @@ cron-job.org 对下面的地址发 POST（Header: `Authorization: Bearer <fine-g
 - `concurrency: seat-watch`：上一轮未结束时新触发排队，不并行。
 - 新出现的空位发 critical 通知；持续存在的空位每 30 分钟降级提醒一次（状态通过 `actions/cache` 在运行间保存）。
 - 登录失败 / 页面异常 / 连续刷新失败时通知管理员，且 Actions 显示为失败。
+- 每次运行的结果在 Actions 运行页的 Summary 查看（检查次数、空位数、通知次数、错误原因，不含具体空位）；有新空位或出错时还有 notice / error 注解。
 - 日志中不输出异常原文（避免泄漏 secret URL）。
 
 ## 测试
