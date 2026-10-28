@@ -1,18 +1,21 @@
 name: Course Seat Watch
 
 on:
-  # push:
-  #   paths:
-  #     - '.github/workflows/watch.yaml'
-  # schedule:
-  #   # 每15分钟触发一次，避免单个job过长导致session不稳定
-  #   - cron: "*/15 * * * *"
+  # 由 cron-job.org 每 15 分钟调用 workflow_dispatch API 触发
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+# 同一时间只跑一个；上一轮未结束时新触发排队（GitHub 最多保留 1 个 pending），避免重复登录触发操作次数限制
+concurrency:
+  group: seat-watch
+  cancel-in-progress: false
 
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 25   # 原来是20，现在单次流程本身就要跑16分钟+前置的pip install等，20分钟可能不够，留出余量改成25
+    timeout-minutes: 25   # 单次约 14 分钟 + 环境准备，留出余量
 
     steps:
       - name: Checkout repository
@@ -22,9 +25,18 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
 
       - name: Install dependencies
-        run: pip install requests beautifulsoup4
+        run: pip install -r requirements.txt
+
+      # 恢复上次已通知的空位状态（缓存 key 不可覆盖，所以每次用 run_id 新建并按前缀恢复最新的）
+      - name: Restore notified state
+        uses: actions/cache/restore@v4
+        with:
+          path: .state
+          key: seat-state-${{ github.run_id }}
+          restore-keys: seat-state-
 
       - name: Run seat monitor
         run: python -u seat_watch.py
@@ -35,3 +47,10 @@ jobs:
           PASSWORD: ${{ secrets.PASSWORD }}
           BARK_KEY_1: ${{ secrets.BARK_KEY_1 }}
           BARK_KEY_2: ${{ secrets.BARK_KEY_2 }}
+
+      - name: Save notified state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .state
+          key: seat-state-${{ github.run_id }}
