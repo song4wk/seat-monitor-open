@@ -24,16 +24,19 @@ def test_get_hidden_fields_missing_form():
     assert seat_watch.get_hidden_fields("<html></html>", "LOGIN") == {}
 
 
-def test_new_slot_then_cooldown_then_gone():
+def test_new_slot_repeat_then_cooldown_then_gone():
+    split = seat_watch.split_new_and_remind
     state = {}
-    new, remind = seat_watch.split_new_and_remind(["a"], state, 1000)
-    assert (new, remind) == (["a"], [])
+    assert split(["a"], state, 1000) == (["a"], [], [])
 
-    new, remind = seat_watch.split_new_and_remind(["a"], state, 1100)
-    assert (new, remind) == ([], [])
+    # 下一次检查：再发一次 critical
+    assert split(["a"], state, 1120) == ([], ["a"], [])
 
-    new, remind = seat_watch.split_new_and_remind(["a"], state, 1000 + seat_watch.REMIND_COOLDOWN)
-    assert (new, remind) == ([], ["a"])
+    # 之后冷却期内不再通知
+    assert split(["a"], state, 1240) == ([], [], [])
+
+    # 冷却期满：降级提醒
+    assert split(["a"], state, 1120 + seat_watch.REMIND_COOLDOWN) == ([], [], ["a"])
 
     seat_watch.split_new_and_remind([], state, 5000)
     assert state == {}
