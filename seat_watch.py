@@ -336,13 +336,12 @@ def run():
     errors = 0
     for idx in range(1, MAX_REFRESH_CYCLES + 1):
         time.sleep(POLL_INTERVAL)
-        now = datetime.now(TZ).strftime("%H:%M:%S")
         try:
             r = session.post(RESERVE_URL, data=payload, timeout=15)
             r.encoding = "shift_jis"
         except Exception as exc:
             errors += 1
-            log(f"[{now}] ❌ 第 {idx} 次刷新发生网络异常: {describe(exc)}")
+            log(f"❌ 第 {idx} 次刷新发生网络异常: {describe(exc)}")
             annotate("warning", "刷新网络异常", f"第 {idx} 次刷新失败（连续 {errors} 次）")
             if errors >= MAX_CONSECUTIVE_REFRESH_ERRORS:
                 notify_admin("⚠️ 监控中断", f"连续 {errors} 次刷新网络异常")
@@ -351,12 +350,12 @@ def run():
         errors = 0
 
         if "最新の内容に更新する" not in r.text:
-            log(f"[{now}] ❌ 第 {idx} 次刷新失败，页面返回异常")
+            log(f"❌ 第 {idx} 次刷新失败，页面返回异常")
             notify_admin("⚠️ 监控中断", f"第 {idx} 次刷新失败")
             return fail(f"第 {idx} 次刷新页面返回异常")
 
         payload = get_refresh_payload(r.text)
-        handle_slots(find_free_slots(r.text), state, f"[{now}] [{idx}]")
+        handle_slots(find_free_slots(r.text), state, f"[{idx}]")
 
     log("✅ 本轮任务完成")
     return 0
