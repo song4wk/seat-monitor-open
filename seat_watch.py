@@ -1,16 +1,21 @@
 """
-course_watch.py
+seat_watch.py
 驾校课表空位检测脚本（单次运行版，供 GitHub Actions 定时触发）
 系统错误只通知管理员（BARK_KEY_1），有空位通知全员
 """
 
+import json
 import os
+import sys
 import time
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 BASE = os.environ["BASE"]
 LOGIN_URL = f"{BASE}/login.asp"
@@ -24,17 +29,21 @@ CARTYPE = "002"  # ＡＴ
 TZ = ZoneInfo("Asia/Tokyo")
 ADMIN_KEY = os.environ.get("BARK_KEY_1", "")
 
-ALL_KEYS = [
-    os.environ.get("BARK_KEY_1", ""),
-    os.environ.get("BARK_KEY_2", "")
-]
-ALL_KEYS = [k for k in ALL_KEYS if k]
+RECIPIENTS = {name: key for name, key in {
+    "admin": ADMIN_KEY, "user2": os.environ.get("BARK_KEY_2", "")
+}.items() if key}
 
 TIME_SLOTS = ["8:05", "9:00", "9:55", "10:50", "11:45", "13:30",
               "14:25", "15:20", "16:15", "17:15", "18:10", "19:05", "20:00"]
 
 POLL_INTERVAL = 120
 MAX_REFRESH_CYCLES = 7
+MAX_CONSECUTIVE_REFRESH_ERRORS = 3
+
+# 已通知空位的状态文件（由 workflow 的 actions/cache 在各次运行间保存）
+STATE_FILE = Path(os.environ.get("STATE_FILE", ".state/notified.json"))
+CRITICAL_REPEATS = 2  # 每个空位最多发 2 次 critical（防止第一次没听到）
+REMIND_COOLDOWN = 30 * 60  # 之后空位持续存在时，每 30 分钟降级提醒一次
 
 
 def now_in_jst():
@@ -43,6 +52,11 @@ def now_in_jst():
 
 def log(message):
     print(f"[{datetime.now(TZ).strftime('%H:%M:%S')}] {message}")
+
+
+def describe(exc):
+    # requests 的异常文本含完整 URL（BASE 是 secret），公开仓库的日志里只记录类型
+    return type(exc).__name__
 
 
 def should_run():
@@ -55,10 +69,33 @@ def should_run():
     return False
 
 
+def make_session():
+    session = requests.Session()
+    session.headers.update({"User-Agent": "Mozilla/5.0"})
+    retry = Retry(total=2, backoff_factor=1, status_forcelist=(502, 503, 504))
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def refresh_page(session, payload):
+    # 仅重试只读刷新；登录 POST 不自动重放，避免消耗操作次数。
+    for attempt in range(3):
+        response = session.post(RESERVE_URL, data=payload, timeout=15)
+        if response.status_code not in (502, 503, 504) or attempt == 2:
+            response.raise_for_status()
+            response.encoding = "shift_jis"
+            return response
+        time.sleep(2 ** attempt)
+
+
 def get_hidden_fields(html, form_name=None):
     soup = BeautifulSoup(html, "html.parser")
     form = soup.find("form", {"name": form_name}) if form_name else soup
     fields = {}
+    if form is None:
+        return fields
     for inp in form.find_all("input", {"type": "hidden"}):
         name = inp.get("name")
         if name:
@@ -71,7 +108,7 @@ def login_and_get_reserve_page(session):
         r0 = session.get(LOGIN_URL, timeout=15)
         r0.encoding = "shift_jis"
     except Exception as exc:
-        log(f"❌ 登录页面请求失败: {exc}")
+        log(f"❌ 登录页面请求失败: {describe(exc)}")
         return None
 
     if "操作回数制限" in r0.text:
@@ -85,14 +122,17 @@ def login_and_get_reserve_page(session):
         r1 = session.post(CARTYPE_URL, data=login_payload, timeout=15)
         r1.encoding = "shift_jis"
     except Exception as exc:
-        log(f"❌ 登录提交失败: {exc}")
+        log(f"❌ 登录提交失败: {describe(exc)}")
         return None
 
     if "操作回数制限" in r1.text:
         log("⛔ 登录过程中提示操作次数已达上限")
         return "LIMIT_EXCEEDED"
-    if "不正です" in r1.text or "個人情報" not in r1.text:
-        log("❌ 登录失败：账号或密码异常")
+    if "不正です" in r1.text:
+        log("❌ 登录失败：账号或密码错误")
+        return "BAD_CREDENTIALS"
+    if "個人情報" not in r1.text:
+        log("❌ 登录后页面不符合预期（可能是页面结构变更）")
         return None
 
     cartype_hidden = get_hidden_fields(r1.text, "TypeSelect")
@@ -102,7 +142,7 @@ def login_and_get_reserve_page(session):
         r2 = session.post(RESERVE_URL, data=reserve_payload, timeout=15)
         r2.encoding = "shift_jis"
     except Exception as exc:
-        log(f"❌ 进入 reserve 列表失败: {exc}")
+        log(f"❌ 进入 reserve 列表失败: {describe(exc)}")
         return None
 
     if "最新の内容に更新する" in r2.text or "空きあり" in r2.text:
@@ -128,15 +168,20 @@ def find_free_slots(html):
     return slots
 
 
-def _send_bark(key, title, body):
+def _send_bark(key, title, body, critical=True):
+    payload = {"device_key": key, "title": title, "body": body}
+    if critical:
+        payload.update({"level": "critical", "call": "1", "sound": "alarm"})
     try:
-        requests.get(
-            f"https://api.day.app/{key}/{title}/{body}",
-            params={"level": "critical", "call": "1", "sound": "alarm"},
-            timeout=5,
-        )
+        response = requests.post("https://api.day.app/push", json=payload, timeout=5)
+        response.raise_for_status()
+        if response.json().get("code") != 200:
+            log("通知发送失败: Bark 返回非成功结果")
+            return False
+        return True
     except Exception as exc:
-        log(f"通知发送失败 (key: {key[:6]}...): {exc}")
+        log(f"通知发送失败: {describe(exc)}")
+        return False
 
 
 def notify_admin(title, body):
@@ -144,9 +189,165 @@ def notify_admin(title, body):
         _send_bark(ADMIN_KEY, title, body)
 
 
-def notify_all(title, body):
-    for key in ALL_KEYS:
-        _send_bark(key, title, body)
+def load_state():
+    try:
+        state = json.loads(STATE_FILE.read_text())
+        return state if isinstance(state, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state):
+    try:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(json.dumps(state, ensure_ascii=False))
+    except OSError as exc:
+        log(f"状态保存失败: {describe(exc)}")
+
+
+def split_new_and_remind(slots, state, now_ts):
+    """返回 (新出现, 二次 critical, 降级提醒)，并更新 state（只保留当前空位）。
+
+    state: {slot: {"ts": 上次通知时间, "count": 已发 critical 次数}}
+    第一次没听到的话，下一次检查（约 2 分钟后）空位仍在就再发一次 critical，之后按冷却时间降级提醒。
+    """
+    current = set(slots)
+    new, repeat, remind = [], [], []
+    for s in slots:
+        entry = state.get(s)
+        if not isinstance(entry, dict):
+            state[s] = {"ts": now_ts, "count": 1}
+            new.append(s)
+        elif entry["count"] < CRITICAL_REPEATS:
+            entry["count"] += 1
+            entry["ts"] = now_ts
+            repeat.append(s)
+        elif now_ts - entry["ts"] >= REMIND_COOLDOWN:
+            entry["ts"] = now_ts
+            remind.append(s)
+    for s in list(state):
+        if s not in current:
+            del state[s]
+    return new, repeat, remind
+
+
+def new_stats():
+    return {"result": "ok", "reason": "", "checks": 0, "last_free": None, "last_checked_at": None, "max_free": 0,
+            "notification_errors": 0,
+            "notified_new": 0, "notified_repeat": 0, "notified_remind": 0}
+
+
+STATS = new_stats()
+
+
+def annotate(level, title, message):
+    """GitHub Actions 注解（notice / warning / error）。只写数量和原因，不写具体空位。"""
+    print(f"::{level} title={title}::{message}")
+
+
+def fail(reason):
+    STATS["result"] = "error"
+    STATS["reason"] = reason
+    annotate("error", "监控失败", reason)
+    return 1
+
+
+def render_summary(stats):
+    """Job Summary 的 Markdown。公开仓库，只含数量，不含空位日期/时间。"""
+    icon, label = {"ok": ("✅", "正常"), "skipped": ("⏭️", "已跳过（不在执行窗口）"),
+                   "error": ("❌", "异常")}[stats["result"]]
+    lines = [f"## {icon} 本轮监控：{label}", ""]
+    if stats["reason"]:
+        lines += [f"**原因**：{stats['reason']}", ""]
+    lines += [
+        "| 项目 | 数值 |", "|---|---|",
+        f"| 检查次数 | {stats['checks']} |",
+        f"| 本轮最多空位数 | {stats['max_free']} |",
+        f"| 新空位通知 | {stats['notified_new']} |",
+        f"| 二次通知 | {stats['notified_repeat']} |",
+        f"| 降级提醒 | {stats['notified_remind']} |",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def write_summary(stats):
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(render_summary(stats))
+    except OSError as exc:
+        log(f"摘要写入失败: {describe(exc)}")
+
+
+def build_run_record(stats, finished_at, run_url=""):
+    """状态页的一条运行记录。公开页面，只含数量和时间，不含具体空位。"""
+    return {"time": finished_at.isoformat(timespec="seconds"), "run_url": run_url,
+            "run_id": os.environ.get("GITHUB_RUN_ID", ""),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""), **stats}
+
+
+def write_run_record(stats):
+    """把本轮结果写到独立运行记录文件，供 workflow 推送到 status 分支。"""
+    server = os.environ.get("GITHUB_SERVER_URL", "")
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    run_id = os.environ.get("GITHUB_RUN_ID", "")
+    run_url = f"{server}/{repo}/actions/runs/{run_id}" if server and repo and run_id else ""
+    try:
+        path = Path(os.environ.get("RUN_RECORD_FILE", "last_run.json"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(build_run_record(stats, now_in_jst(), run_url),
+                                   ensure_ascii=False))
+    except OSError as exc:
+        log(f"运行记录写入失败: {describe(exc)}")
+
+
+def handle_slots(slots, state, tag):
+    # v2 将接收人独立跟踪。旧缓存无法确认各人的送达情况，重新通知一次。
+    slots = list(dict.fromkeys(slots))
+    current = set(slots)
+    for slot in list(state):
+        if slot not in current:
+            del state[slot]
+    STATS["checks"] += 1
+    STATS["last_free"] = len(slots)
+    STATS["last_checked_at"] = now_in_jst().isoformat(timespec="seconds")
+    STATS["max_free"] = max(STATS["max_free"], len(slots))
+    log(f"{tag} 空位数: {len(slots)}")
+    for recipient, key in RECIPIENTS.items():
+        delivered = {}
+        for slot in slots:
+            entry = state.get(slot, {})
+            delivered[slot] = dict(entry.get(recipient, {})) if isinstance(entry, dict) else {}
+        # 使用副本规划；只有 API 确认成功才提交对应的状态。
+        for slot in list(delivered):
+            entry = delivered[slot]
+            if (not isinstance(entry.get("count"), int)
+                    or not isinstance(entry.get("ts"), (int, float))):
+                del delivered[slot]
+        new, repeat, remind = split_new_and_remind(slots, delivered, time.time())
+        for group, title, kind, critical in (
+            (new, "有空位！", "new", True),
+            (repeat, "有空位！（再次通知）", "repeat", True),
+            (remind, "仍有空位", "remind", False),
+        ):
+            if not group:
+                continue
+            if _send_bark(key, title, "、".join(group), critical):
+                for slot in group:
+                    entry = state.setdefault(slot, {})
+                    if "count" in entry:  # 清除旧格式
+                        entry.clear()
+                    entry[recipient] = delivered[slot]
+                save_state(state)
+                STATS[f"notified_{kind}"] += len(group)
+                annotate("notice", "通知成功", f"{len(group)} 个空位通知已发送")
+            else:
+                STATS["notification_errors"] += 1
+                annotate("warning", "通知失败", "未更新送达状态，下次检查重试")
+    save_state(state)
 
 
 def get_refresh_payload(html):
@@ -156,7 +357,8 @@ def get_refresh_payload(html):
     return get_hidden_fields(html)
 
 
-def main():
+def run():
+    """返回进程退出码：0 正常，1 异常（让 Actions 显示红色）。"""
     log("========================================")
     log("🚀 开始执行本轮课表空位检测")
     log(f"当前时间: {now_in_jst().strftime('%Y-%m-%d %H:%M:%S')} JST")
@@ -164,62 +366,73 @@ def main():
     if not should_run():
         log("⏭️ 当前时间不在执行窗口，跳过本轮任务")
         log("========================================")
-        return
+        STATS["result"] = "skipped"
+        return 0
 
-    session = requests.Session()
-    session.headers.update({"User-Agent": "Mozilla/5.0"})
+    session = make_session()
 
     html = login_and_get_reserve_page(session)
     if html == "LIMIT_EXCEEDED":
         log("⛔ 今日操作次数已用尽，退出任务")
         notify_admin("⚠️ 监控失败", "今日操作次数已用尽")
-        log("========================================")
-        return
+        return fail("今日操作次数已用尽")
+    if html == "BAD_CREDENTIALS":
+        notify_admin("⚠️ 监控失败", "账号或密码错误")
+        return fail("账号或密码错误")
     if not html:
         log("❌ 登录或 reserve 页面获取失败，退出任务")
         notify_admin("⚠️ 监控异常", "登录或 reserve 页面获取失败")
-        log("========================================")
-        return
+        return fail("登录或 reserve 页面获取失败")
 
     log("✅ 登录成功，开始本轮短任务监控")
 
+    state = load_state()
     payload = get_refresh_payload(html)
-    slots = find_free_slots(html)
+    handle_slots(find_free_slots(html), state, "[首次]")
 
-    if slots:
-        msg = "、".join(slots)
-        log(f"🎉 首次检测发现空位: {msg}")
-        notify_all("有空位！", msg)
-    else:
-        log("首次检测... 空位数: 0")
-
+    errors = 0
     for idx in range(1, MAX_REFRESH_CYCLES + 1):
         time.sleep(POLL_INTERVAL)
-        now = datetime.now(TZ).strftime("%H:%M:%S")
         try:
-            r = session.post(RESERVE_URL, data=payload, timeout=15)
-            r.encoding = "shift_jis"
+            r = refresh_page(session, payload)
         except Exception as exc:
-            log(f"[{now}] ❌ 第 {idx} 次刷新发生网络异常: {exc}")
+            errors += 1
+            log(f"❌ 第 {idx} 次刷新发生网络异常: {describe(exc)}")
+            annotate("warning", "刷新网络异常", f"第 {idx} 次刷新失败（连续 {errors} 次）")
+            if errors >= MAX_CONSECUTIVE_REFRESH_ERRORS:
+                notify_admin("⚠️ 监控中断", f"连续 {errors} 次刷新网络异常")
+                return fail(f"连续 {errors} 次刷新网络异常")
             continue
+        errors = 0
 
         if "最新の内容に更新する" not in r.text:
-            log(f"[{now}] ❌ 第 {idx} 次刷新失败，页面返回异常")
+            log(f"❌ 第 {idx} 次刷新失败，页面返回异常")
             notify_admin("⚠️ 监控中断", f"第 {idx} 次刷新失败")
-            log("========================================")
-            return
+            return fail(f"第 {idx} 次刷新页面返回异常")
 
         payload = get_refresh_payload(r.text)
-        slots = find_free_slots(r.text)
-        if slots:
-            msg = "、".join(slots)
-            log(f"[{now}] [{idx}] 🎉 检测中... 发现空位: {msg}")
-            notify_all("有空位！", msg)
-        else:
-            log(f"[{now}] [{idx}] 检测中... 空位数: 0")
+        handle_slots(find_free_slots(r.text), state, f"[{idx}]")
 
+    if errors:
+        notify_admin("⚠️ 监控不完整", "任务结束时刷新尚未恢复")
+        return fail("任务结束时刷新尚未恢复")
+    if STATS["notification_errors"]:
+        return fail("本轮存在通知发送失败，请检查告警")
     log("✅ 本轮任务完成")
+    return 0
+
+
+def main():
+    try:
+        code = run()
+    except Exception as exc:
+        log(f"❌ 未预期的异常: {describe(exc)}")
+        notify_admin("⚠️ 监控崩溃", describe(exc))
+        code = fail(f"未预期的异常: {describe(exc)}")
+    write_summary(STATS)
+    write_run_record(STATS)
     log("========================================")
+    sys.exit(code)
 
 
 if __name__ == "__main__":

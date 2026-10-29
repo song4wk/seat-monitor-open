@@ -1,18 +1,23 @@
 name: Course Seat Watch
 
 on:
-  # push:
-  #   paths:
-  #     - '.github/workflows/watch.yaml'
-  # schedule:
-  #   # 每15分钟触发一次，避免单个job过长导致session不稳定
-  #   - cron: "*/15 * * * *"
+  # 由 cron-job.org 每 15 分钟调用 workflow_dispatch API 触发
   workflow_dispatch:
+
+permissions:
+  contents: write   # 仅用于把状态记录推送到 status 分支
+
+# 同一时间只跑一个；上一轮未结束时新触发排队（GitHub 最多保留 1 个 pending），避免重复登录触发操作次数限制
+concurrency:
+  group: seat-watch
+  cancel-in-progress: false
 
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 25   # 原来是20，现在单次流程本身就要跑16分钟+前置的pip install等，20分钟可能不够，留出余量改成25
+    outputs:
+      pages_ready: ${{ steps.publish.outcome == 'success' }}
+    timeout-minutes: 25   # 单次约 14 分钟 + 环境准备，留出余量
 
     steps:
       - name: Checkout repository
@@ -22,16 +27,79 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
 
       - name: Install dependencies
-        run: pip install requests beautifulsoup4
+        run: pip install -r requirements.txt
+
+      # 恢复上次已通知的空位状态（缓存 key 不可覆盖，所以每次用 run_id 新建并按前缀恢复最新的）
+      - name: Restore notified state
+        uses: actions/cache/restore@v4
+        with:
+          path: .state/notified.json
+          key: seat-state-v2-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: seat-state-v2-
 
       - name: Run seat monitor
         run: python -u seat_watch.py
         env:
+          RUN_RECORD_FILE: ${{ runner.temp }}/last_run.json
           PYTHONUNBUFFERED: "1"
           BASE: ${{ secrets.BASE }}
           USER_ID: ${{ secrets.USER_ID }}
           PASSWORD: ${{ secrets.PASSWORD }}
           BARK_KEY_1: ${{ secrets.BARK_KEY_1 }}
           BARK_KEY_2: ${{ secrets.BARK_KEY_2 }}
+
+      - name: Save notified state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .state/notified.json
+          key: seat-state-v2-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # 把本轮结果追加到 status 分支，由 GitHub Pages 展示（只含数量和时间）。失败不影响监控本身。
+      - name: Prepare status page
+        id: publish
+        if: always()
+        continue-on-error: true
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git fetch --depth 1 origin status; then
+            git worktree add status-dir FETCH_HEAD
+          else
+            git worktree add --detach status-dir
+            git -C status-dir rm -rf -q . || true
+          fi
+          python scripts/update_status.py "$RUNNER_TEMP/last_run.json" status-dir
+          cd status-dir
+          # 每次都用只有一个提交的孤儿分支覆盖 status，避免每天约 96 个提交让仓库不断变大
+          git checkout -q --orphan status-new
+          git add -A
+          git commit -q -m "status: run ${GITHUB_RUN_ID}"
+          git push --force origin status-new:status
+          mkdir "$RUNNER_TEMP/pages"
+          cp index.html status.json .nojekyll "$RUNNER_TEMP/pages/"
+
+      - name: Upload status page
+        if: ${{ always() && steps.publish.outcome == 'success' }}
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ runner.temp }}/pages
+
+  deploy:
+    needs: check
+    if: ${{ always() && !cancelled() && needs.check.outputs.pages_ready == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy status page
+        id: deployment
+        uses: actions/deploy-pages@v4
