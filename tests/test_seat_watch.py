@@ -73,3 +73,21 @@ def test_new_slot_repeat_then_cooldown_then_gone():
 
     seat_watch.split_new_and_remind([], state, 5000)
     assert state == {}
+
+
+def test_build_run_record_has_counts_and_no_slots():
+    from datetime import datetime
+    stats = seat_watch.new_stats()
+    stats.update(checks=8, last_free=1)
+    rec = seat_watch.build_run_record(stats, datetime(2026, 10, 29, 14, 15, 0), "https://x/run/1")
+    assert rec["time"] == "2026-10-29T14:15:00" and rec["last_free"] == 1
+    assert rec["run_url"] == "https://x/run/1" and "slots" not in rec
+
+
+def test_merge_run_newest_first_and_capped():
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
+    import update_status
+    status = {}
+    for i in range(5):
+        status = update_status.merge_run(status, {"n": i}, max_runs=3)
+    assert [r["n"] for r in status["runs"]] == [4, 3, 2]

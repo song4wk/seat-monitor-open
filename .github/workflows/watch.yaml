@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write   # 仅用于把状态记录推送到 status 分支
 
 # 同一时间只跑一个；上一轮未结束时新触发排队（GitHub 最多保留 1 个 pending），避免重复登录触发操作次数限制
 concurrency:
@@ -54,3 +54,26 @@ jobs:
         with:
           path: .state
           key: seat-state-${{ github.run_id }}
+
+      # 把本轮结果追加到 status 分支，由 GitHub Pages 展示（只含数量和时间）。失败不影响监控本身。
+      - name: Publish status page
+        if: always()
+        continue-on-error: true
+        run: |
+          set -e
+          [ -f .state/last_run.json ] || exit 0
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git fetch --depth 1 origin status; then
+            git worktree add status-dir FETCH_HEAD
+            git -C status-dir checkout -q -B status
+          else
+            git worktree add --detach status-dir
+            git -C status-dir checkout -q --orphan status
+            git -C status-dir rm -rf -q . || true
+          fi
+          python scripts/update_status.py .state/last_run.json status-dir
+          cd status-dir
+          git add -A
+          git commit -q -m "status: run ${GITHUB_RUN_ID}"
+          git push origin status

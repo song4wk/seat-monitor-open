@@ -221,7 +221,7 @@ def split_new_and_remind(slots, state, now_ts):
 
 
 def new_stats():
-    return {"result": "ok", "reason": "", "checks": 0, "max_free": 0,
+    return {"result": "ok", "reason": "", "checks": 0, "last_free": 0, "max_free": 0,
             "notified_new": 0, "notified_repeat": 0, "notified_remind": 0}
 
 
@@ -270,10 +270,31 @@ def write_summary(stats):
         log(f"摘要写入失败: {describe(exc)}")
 
 
+def build_run_record(stats, finished_at, run_url=""):
+    """状态页的一条运行记录。公开页面，只含数量和时间，不含具体空位。"""
+    return {"time": finished_at.isoformat(timespec="seconds"), "run_url": run_url, **stats}
+
+
+def write_run_record(stats):
+    """把本轮结果写到 .state/last_run.json，供 workflow 推送到 status 分支。"""
+    server = os.environ.get("GITHUB_SERVER_URL", "")
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    run_id = os.environ.get("GITHUB_RUN_ID", "")
+    run_url = f"{server}/{repo}/actions/runs/{run_id}" if server and repo and run_id else ""
+    try:
+        path = STATE_FILE.parent / "last_run.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(build_run_record(stats, now_in_jst(), run_url),
+                                   ensure_ascii=False))
+    except OSError as exc:
+        log(f"运行记录写入失败: {describe(exc)}")
+
+
 def handle_slots(slots, state, tag):
     new, repeat, remind = split_new_and_remind(slots, state, time.time())
     save_state(state)
     STATS["checks"] += 1
+    STATS["last_free"] = len(slots)
     STATS["max_free"] = max(STATS["max_free"], len(slots))
     STATS["notified_new"] += len(new)
     STATS["notified_repeat"] += len(repeat)
@@ -369,6 +390,7 @@ def main():
         notify_admin("⚠️ 监控崩溃", describe(exc))
         code = fail(f"未预期的异常: {describe(exc)}")
     write_summary(STATS)
+    write_run_record(STATS)
     log("========================================")
     sys.exit(code)
 
