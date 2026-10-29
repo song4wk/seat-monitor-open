@@ -69,19 +69,17 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           if git fetch --depth 1 origin status; then
             git worktree add status-dir FETCH_HEAD
-            git -C status-dir checkout -q -B status
           else
             git worktree add --detach status-dir
-            git -C status-dir checkout -q --orphan status
             git -C status-dir rm -rf -q . || true
           fi
           python scripts/update_status.py "$RUNNER_TEMP/last_run.json" status-dir
           cd status-dir
+          # 每次都用只有一个提交的孤儿分支覆盖 status，避免每天约 96 个提交让仓库不断变大
+          git checkout -q --orphan status-new
           git add -A
-          if ! git diff --cached --quiet; then
-            git commit -q -m "status: run ${GITHUB_RUN_ID}"
-          fi
-          git push origin status
+          git commit -q -m "status: run ${GITHUB_RUN_ID}"
+          git push --force origin status-new:status
           mkdir "$RUNNER_TEMP/pages"
           cp index.html status.json .nojekyll "$RUNNER_TEMP/pages/"
 

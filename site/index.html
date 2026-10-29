@@ -16,6 +16,8 @@
   .big { font-size:22px; font-weight:600; }
   .ok { color:var(--ok); } .error { color:var(--err); } .skipped { color:var(--skip); } .free { color:var(--free); }
   .muted { color:var(--muted); font-size:13px; }
+  .stale { border-color:var(--err); }
+  .banner { color:var(--err); font-weight:600; margin-bottom:8px; }
   table { width:100%; border-collapse:collapse; font-size:13px; }
   th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
   a { color:var(--free); }
@@ -32,6 +34,8 @@
   <p class="muted">只显示数量，不含具体空位。页面每 60 秒自动刷新。</p>
 </main>
 <script>
+// 每轮约 15 分钟，超过这个时间没有新记录就认为监控停了
+const STALE_MINUTES = 40;
 const LABEL = { ok: "✅ 正常", error: "❌ 异常", skipped: "⏭️ 跳过" };
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[c]));
 const fmt = iso => iso ? iso.replace("T", " ").slice(0, 19) : "未检查";
@@ -51,7 +55,11 @@ async function load() {
   const latest = document.getElementById("latest");
   if (!runs.length) { latest.textContent = "暂无运行记录"; return; }
   const r = runs[0];
+  const staleMin = Math.round((Date.now() - new Date(r.time).getTime()) / 60000);
+  const stale = staleMin > STALE_MINUTES;
+  latest.classList.toggle("stale", stale);
   latest.innerHTML =
+    (stale ? `<div class="banner">⚠️ 数据已 ${staleMin} 分钟没有更新，监控可能已停止</div>` : "") +
     `<div class="big ${esc(r.result)}">${LABEL[r.result] || esc(r.result)}</div>` +
     `<div>最后一次检查空位数：<span class="big ${r.last_free ? "free" : ""}">${r.last_free ?? "未检查"}</span></div>` +
     `<div class="muted">最后成功检查：${fmt(r.last_checked_at)}</div>` +
