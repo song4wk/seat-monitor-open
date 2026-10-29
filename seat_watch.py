@@ -29,11 +29,9 @@ CARTYPE = "002"  # ＡＴ
 TZ = ZoneInfo("Asia/Tokyo")
 ADMIN_KEY = os.environ.get("BARK_KEY_1", "")
 
-ALL_KEYS = [
-    os.environ.get("BARK_KEY_1", ""),
-    os.environ.get("BARK_KEY_2", "")
-]
-ALL_KEYS = [k for k in ALL_KEYS if k]
+RECIPIENTS = {name: key for name, key in {
+    "admin": ADMIN_KEY, "user2": os.environ.get("BARK_KEY_2", "")
+}.items() if key}
 
 TIME_SLOTS = ["8:05", "9:00", "9:55", "10:50", "11:45", "13:30",
               "14:25", "15:20", "16:15", "17:15", "18:10", "19:05", "20:00"]
@@ -79,6 +77,17 @@ def make_session():
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     return session
+
+
+def refresh_page(session, payload):
+    # 仅重试只读刷新；登录 POST 不自动重放，避免消耗操作次数。
+    for attempt in range(3):
+        response = session.post(RESERVE_URL, data=payload, timeout=15)
+        if response.status_code not in (502, 503, 504) or attempt == 2:
+            response.raise_for_status()
+            response.encoding = "shift_jis"
+            return response
+        time.sleep(2 ** attempt)
 
 
 def get_hidden_fields(html, form_name=None):
@@ -164,9 +173,15 @@ def _send_bark(key, title, body, critical=True):
     if critical:
         payload.update({"level": "critical", "call": "1", "sound": "alarm"})
     try:
-        requests.post("https://api.day.app/push", json=payload, timeout=5)
+        response = requests.post("https://api.day.app/push", json=payload, timeout=5)
+        response.raise_for_status()
+        if response.json().get("code") != 200:
+            log("通知发送失败: Bark 返回非成功结果")
+            return False
+        return True
     except Exception as exc:
         log(f"通知发送失败: {describe(exc)}")
+        return False
 
 
 def notify_admin(title, body):
@@ -174,14 +189,10 @@ def notify_admin(title, body):
         _send_bark(ADMIN_KEY, title, body)
 
 
-def notify_all(title, body, critical=True):
-    for key in ALL_KEYS:
-        _send_bark(key, title, body, critical)
-
-
 def load_state():
     try:
-        return json.loads(STATE_FILE.read_text())
+        state = json.loads(STATE_FILE.read_text())
+        return state if isinstance(state, dict) else {}
     except (OSError, ValueError):
         return {}
 
@@ -221,7 +232,8 @@ def split_new_and_remind(slots, state, now_ts):
 
 
 def new_stats():
-    return {"result": "ok", "reason": "", "checks": 0, "last_free": 0, "max_free": 0,
+    return {"result": "ok", "reason": "", "checks": 0, "last_free": None, "last_checked_at": None, "max_free": 0,
+            "notification_errors": 0,
             "notified_new": 0, "notified_repeat": 0, "notified_remind": 0}
 
 
@@ -272,17 +284,19 @@ def write_summary(stats):
 
 def build_run_record(stats, finished_at, run_url=""):
     """状态页的一条运行记录。公开页面，只含数量和时间，不含具体空位。"""
-    return {"time": finished_at.isoformat(timespec="seconds"), "run_url": run_url, **stats}
+    return {"time": finished_at.isoformat(timespec="seconds"), "run_url": run_url,
+            "run_id": os.environ.get("GITHUB_RUN_ID", ""),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""), **stats}
 
 
 def write_run_record(stats):
-    """把本轮结果写到 .state/last_run.json，供 workflow 推送到 status 分支。"""
+    """把本轮结果写到独立运行记录文件，供 workflow 推送到 status 分支。"""
     server = os.environ.get("GITHUB_SERVER_URL", "")
     repo = os.environ.get("GITHUB_REPOSITORY", "")
     run_id = os.environ.get("GITHUB_RUN_ID", "")
     run_url = f"{server}/{repo}/actions/runs/{run_id}" if server and repo and run_id else ""
     try:
-        path = STATE_FILE.parent / "last_run.json"
+        path = Path(os.environ.get("RUN_RECORD_FILE", "last_run.json"))
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(build_run_record(stats, now_in_jst(), run_url),
                                    ensure_ascii=False))
@@ -291,27 +305,49 @@ def write_run_record(stats):
 
 
 def handle_slots(slots, state, tag):
-    new, repeat, remind = split_new_and_remind(slots, state, time.time())
-    save_state(state)
+    # v2 将接收人独立跟踪。旧缓存无法确认各人的送达情况，重新通知一次。
+    slots = list(dict.fromkeys(slots))
+    current = set(slots)
+    for slot in list(state):
+        if slot not in current:
+            del state[slot]
     STATS["checks"] += 1
     STATS["last_free"] = len(slots)
+    STATS["last_checked_at"] = now_in_jst().isoformat(timespec="seconds")
     STATS["max_free"] = max(STATS["max_free"], len(slots))
-    STATS["notified_new"] += len(new)
-    STATS["notified_repeat"] += len(repeat)
-    STATS["notified_remind"] += len(remind)
-    if new:
-        annotate("notice", "发现新空位", f"{len(new)} 个新空位，已通知")
-    if slots:
-        log(f"{tag} 🎉 发现空位: {'、'.join(slots)}"
-            f"（新增 {len(new)}，二次 {len(repeat)}，提醒 {len(remind)}）")
-    else:
-        log(f"{tag} 空位数: 0")
-    if new:
-        notify_all("有空位！", "、".join(new))
-    if repeat:
-        notify_all("有空位！（再次通知）", "、".join(repeat))
-    if remind:
-        notify_all("仍有空位", "、".join(remind), critical=False)
+    log(f"{tag} 空位数: {len(slots)}")
+    for recipient, key in RECIPIENTS.items():
+        delivered = {}
+        for slot in slots:
+            entry = state.get(slot, {})
+            delivered[slot] = dict(entry.get(recipient, {})) if isinstance(entry, dict) else {}
+        # 使用副本规划；只有 API 确认成功才提交对应的状态。
+        for slot in list(delivered):
+            entry = delivered[slot]
+            if (not isinstance(entry.get("count"), int)
+                    or not isinstance(entry.get("ts"), (int, float))):
+                del delivered[slot]
+        new, repeat, remind = split_new_and_remind(slots, delivered, time.time())
+        for group, title, kind, critical in (
+            (new, "有空位！", "new", True),
+            (repeat, "有空位！（再次通知）", "repeat", True),
+            (remind, "仍有空位", "remind", False),
+        ):
+            if not group:
+                continue
+            if _send_bark(key, title, "、".join(group), critical):
+                for slot in group:
+                    entry = state.setdefault(slot, {})
+                    if "count" in entry:  # 清除旧格式
+                        entry.clear()
+                    entry[recipient] = delivered[slot]
+                save_state(state)
+                STATS[f"notified_{kind}"] += len(group)
+                annotate("notice", "通知成功", f"{len(group)} 个空位通知已发送")
+            else:
+                STATS["notification_errors"] += 1
+                annotate("warning", "通知失败", "未更新送达状态，下次检查重试")
+    save_state(state)
 
 
 def get_refresh_payload(html):
@@ -358,8 +394,7 @@ def run():
     for idx in range(1, MAX_REFRESH_CYCLES + 1):
         time.sleep(POLL_INTERVAL)
         try:
-            r = session.post(RESERVE_URL, data=payload, timeout=15)
-            r.encoding = "shift_jis"
+            r = refresh_page(session, payload)
         except Exception as exc:
             errors += 1
             log(f"❌ 第 {idx} 次刷新发生网络异常: {describe(exc)}")
@@ -378,6 +413,11 @@ def run():
         payload = get_refresh_payload(r.text)
         handle_slots(find_free_slots(r.text), state, f"[{idx}]")
 
+    if errors:
+        notify_admin("⚠️ 监控不完整", "任务结束时刷新尚未恢复")
+        return fail("任务结束时刷新尚未恢复")
+    if STATS["notification_errors"]:
+        return fail("本轮存在通知发送失败，请检查告警")
     log("✅ 本轮任务完成")
     return 0
 

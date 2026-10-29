@@ -22,3 +22,14 @@ cron-job.org 对下面的地址发 POST（Header: `Authorization: Bearer <fine-g
 pip install -r requirements.txt pytest
 pytest
 ```
+
+## 状态页部署
+在仓库 Settings → Pages → Source 选择 **GitHub Actions**。工作流保存历史记录到
+`status` 分支，并通过 Pages artifact 显式部署；不再使用分支自动发布。
+运行记录存放在 runner 临时目录，仅 `notified.json` 用于跨运行缓存。
+缓存中含空位标识（不含凭据），公开仓库缓存不能作为私密存储。
+
+通知按接收人独立去重，只有 Bark API 确认成功后才累计通知次数。
+摘要的通知数为成功发送的「空位 × 接收人」次数。失败会在下一次检查重试，
+本轮有发送失败时标记异常。状态页分别展示运行结束时间与最后成功检查时间，
+未检查显示为「未检查」。只读刷新对 502/503/504 最多重试两次，登录 POST 不重放。

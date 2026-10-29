@@ -15,6 +15,8 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+    outputs:
+      pages_ready: ${{ steps.publish.outcome == 'success' }}
     timeout-minutes: 25   # 单次约 14 分钟 + 环境准备，留出余量
 
     steps:
@@ -34,13 +36,14 @@ jobs:
       - name: Restore notified state
         uses: actions/cache/restore@v4
         with:
-          path: .state
-          key: seat-state-${{ github.run_id }}
-          restore-keys: seat-state-
+          path: .state/notified.json
+          key: seat-state-v2-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: seat-state-v2-
 
       - name: Run seat monitor
         run: python -u seat_watch.py
         env:
+          RUN_RECORD_FILE: ${{ runner.temp }}/last_run.json
           PYTHONUNBUFFERED: "1"
           BASE: ${{ secrets.BASE }}
           USER_ID: ${{ secrets.USER_ID }}
@@ -52,16 +55,16 @@ jobs:
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: .state
-          key: seat-state-${{ github.run_id }}
+          path: .state/notified.json
+          key: seat-state-v2-${{ github.run_id }}-${{ github.run_attempt }}
 
       # 把本轮结果追加到 status 分支，由 GitHub Pages 展示（只含数量和时间）。失败不影响监控本身。
-      - name: Publish status page
+      - name: Prepare status page
+        id: publish
         if: always()
         continue-on-error: true
         run: |
           set -e
-          [ -f .state/last_run.json ] || exit 0
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           if git fetch --depth 1 origin status; then
@@ -72,8 +75,33 @@ jobs:
             git -C status-dir checkout -q --orphan status
             git -C status-dir rm -rf -q . || true
           fi
-          python scripts/update_status.py .state/last_run.json status-dir
+          python scripts/update_status.py "$RUNNER_TEMP/last_run.json" status-dir
           cd status-dir
           git add -A
-          git commit -q -m "status: run ${GITHUB_RUN_ID}"
+          if ! git diff --cached --quiet; then
+            git commit -q -m "status: run ${GITHUB_RUN_ID}"
+          fi
           git push origin status
+          mkdir "$RUNNER_TEMP/pages"
+          cp index.html status.json .nojekyll "$RUNNER_TEMP/pages/"
+
+      - name: Upload status page
+        if: ${{ always() && steps.publish.outcome == 'success' }}
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ runner.temp }}/pages
+
+  deploy:
+    needs: check
+    if: ${{ always() && !cancelled() && needs.check.outputs.pages_ready == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy status page
+        id: deployment
+        uses: actions/deploy-pages@v4

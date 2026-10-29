@@ -91,3 +91,91 @@ def test_merge_run_newest_first_and_capped():
     for i in range(5):
         status = update_status.merge_run(status, {"n": i}, max_runs=3)
     assert [r["n"] for r in status["runs"]] == [4, 3, 2]
+
+
+def test_failed_delivery_does_not_consume_repeat(monkeypatch, tmp_path):
+    from unittest.mock import Mock
+    monkeypatch.setattr(seat_watch, 'STATE_FILE', tmp_path / 'state.json')
+    monkeypatch.setattr(seat_watch, 'RECIPIENTS', {'admin': 'a', 'user2': 'b'})
+    monkeypatch.setattr(seat_watch, 'STATS', seat_watch.new_stats())
+    send = Mock(side_effect=[True, False, True, True])
+    monkeypatch.setattr(seat_watch, '_send_bark', send)
+    state = {}
+    seat_watch.handle_slots(['slot'], state, '')
+    assert state['slot'] == {'admin': {'count': 1, 'ts': state['slot']['admin']['ts']}}
+    assert seat_watch.STATS['notified_new'] == 1
+    seat_watch.handle_slots(['slot'], state, '')
+    assert state['slot']['admin']['count'] == 2
+    assert state['slot']['user2']['count'] == 1
+    assert seat_watch.STATS['notified_new'] == 2
+    seat_watch.handle_slots([], state, '')
+    assert state == {}
+
+
+def test_bark_checks_http_and_business_result(monkeypatch):
+    from unittest.mock import Mock
+    import requests
+    for response in (Mock(json=Mock(return_value={'code': 400})),
+                     Mock(raise_for_status=Mock(side_effect=requests.HTTPError()))):
+        monkeypatch.setattr(seat_watch.requests, 'post', Mock(return_value=response))
+        assert seat_watch._send_bark('secret', 'title', 'body') is False
+    monkeypatch.setattr(seat_watch.requests, 'post',
+                        Mock(return_value=Mock(json=Mock(return_value={'code': 200}))))
+    assert seat_watch._send_bark('secret', 'title', 'body') is True
+
+
+def test_run_final_refresh_errors_are_failure(monkeypatch, tmp_path):
+    from unittest.mock import Mock
+    import requests
+    monkeypatch.setattr(seat_watch, 'STATS', seat_watch.new_stats())
+    monkeypatch.setattr(seat_watch, 'STATE_FILE', tmp_path / 'state.json')
+    monkeypatch.setattr(seat_watch, 'RECIPIENTS', {})
+    monkeypatch.setattr(seat_watch, 'should_run', lambda: True)
+    monkeypatch.setattr(seat_watch, 'make_session', Mock())
+    monkeypatch.setattr(seat_watch, 'login_and_get_reserve_page', lambda s: HTML)
+    monkeypatch.setattr(seat_watch, 'MAX_REFRESH_CYCLES', 2)
+    monkeypatch.setattr(seat_watch.time, 'sleep', Mock())
+    monkeypatch.setattr(seat_watch, 'refresh_page', Mock(side_effect=requests.Timeout()))
+    monkeypatch.setattr(seat_watch, 'notify_admin', Mock())
+    assert seat_watch.run() == 1
+    assert seat_watch.STATS['last_checked_at'] is not None
+    assert seat_watch.STATS['checks'] == 1
+
+
+def test_refresh_retries_gateway_response(monkeypatch):
+    from unittest.mock import Mock
+    monkeypatch.setattr(seat_watch.time, 'sleep', Mock())
+    session = Mock()
+    session.post.side_effect = [Mock(status_code=503), Mock(status_code=502), Mock(status_code=200)]
+    assert seat_watch.refresh_page(session, {}).status_code == 200
+    assert session.post.call_count == 3
+
+
+def test_run_record_is_not_in_notified_cache(monkeypatch, tmp_path):
+    import json
+    monkeypatch.setattr(seat_watch, 'STATE_FILE', tmp_path / 'cache' / 'state.json')
+    monkeypatch.setenv('RUN_RECORD_FILE', str(tmp_path / 'run.json'))
+    monkeypatch.setenv('GITHUB_RUN_ID', '123')
+    monkeypatch.setenv('GITHUB_RUN_ATTEMPT', '2')
+    seat_watch.write_run_record(seat_watch.new_stats())
+    record = json.loads((tmp_path / 'run.json').read_text())
+    assert record['run_id'] == '123' and record['run_attempt'] == '2'
+    assert record['last_free'] is None
+    assert not (tmp_path / 'cache').exists()
+
+
+def test_status_rejects_stale_record_and_deduplicates(monkeypatch, tmp_path):
+    import json
+    from scripts import update_status
+    for name, value in {'GITHUB_RUN_ID': 'new', 'GITHUB_RUN_ATTEMPT': '1',
+                        'GITHUB_SERVER_URL': 'https://github.com',
+                        'GITHUB_REPOSITORY': 'owner/repo'}.items():
+        monkeypatch.setenv(name, value)
+    record_path = tmp_path / 'missing.json'
+    update_status.main(record_path, tmp_path)
+    record = json.loads((tmp_path / 'status.json').read_text())['runs'][0]
+    assert record['result'] == 'error' and record['run_id'] == 'new'
+    record_path.write_text(json.dumps({'run_id': 'old', 'run_attempt': '1', 'result': 'ok'}))
+    update_status.main(record_path, tmp_path)
+    runs = json.loads((tmp_path / 'status.json').read_text())['runs']
+    assert len(runs) == 1 and runs[0]['result'] == 'error'

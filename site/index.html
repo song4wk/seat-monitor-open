@@ -34,7 +34,7 @@
 <script>
 const LABEL = { ok: "✅ 正常", error: "❌ 异常", skipped: "⏭️ 跳过" };
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[c]));
-const fmt = iso => iso.replace("T", " ").slice(0, 19);
+const fmt = iso => iso ? iso.replace("T", " ").slice(0, 19) : "未检查";
 const notified = r => r.notified_new + r.notified_repeat + r.notified_remind;
 
 function ago(iso) {
@@ -53,11 +53,12 @@ async function load() {
   const r = runs[0];
   latest.innerHTML =
     `<div class="big ${esc(r.result)}">${LABEL[r.result] || esc(r.result)}</div>` +
-    `<div>最后一次检查空位数：<span class="big ${r.last_free ? "free" : ""}">${r.last_free}</span></div>` +
-    `<div class="muted">${fmt(r.time)}（${ago(r.time)}）${r.reason ? " · " + esc(r.reason) : ""}</div>`;
+    `<div>最后一次检查空位数：<span class="big ${r.last_free ? "free" : ""}">${r.last_free ?? "未检查"}</span></div>` +
+    `<div class="muted">最后成功检查：${fmt(r.last_checked_at)}</div>` +
+    `<div class="muted">本轮结束：${fmt(r.time)}（${ago(r.time)}）${r.reason ? " · " + esc(r.reason) : ""}</div>`;
   document.getElementById("rows").innerHTML = runs.slice(0, 50).map(r =>
     `<tr><td>${fmt(r.time)}</td><td class="${esc(r.result)}">${LABEL[r.result] || esc(r.result)}</td>` +
-    `<td>${r.last_free}</td><td>${r.checks}</td><td>${notified(r)}</td>` +
+    `<td>${r.last_free ?? "未检查"}</td><td>${r.checks}</td><td>${notified(r)}</td>` +
     `<td>${r.run_url ? `<a href="${esc(r.run_url)}">log</a>` : ""}</td></tr>`).join("");
 }
 load();

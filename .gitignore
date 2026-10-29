@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 .venv/
 status-dir/
+last_run.json
+.pytest_cache/
